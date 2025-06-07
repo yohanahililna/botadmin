@@ -13,6 +13,7 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '1133538088';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://evberyanshxxalxtwnnc.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV2YmVyeWFuc2h4eGFseHR3bm5jIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQwODMwOTcsImV4cCI6MjA1OTY1OTA5N30.pEoPiIi78Tvl5URw0Xy_vAxsd-3XqRlC8FTnX9HpgMw';
 const PORT = process.env.PORT || 3000;
+const WEBHOOK_URL = 'https://botadmin-sn1a.onrender.com';
 
 // Initialize Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -27,58 +28,63 @@ const stats = {
   approvedDeposits: 0,
   rejectedDeposits: 0,
   totalAmount: 0,
-  startTime: new Date()
+  startTime: new Date(),
+  errors: 0
 };
 
 // Enhanced logging function
-function log(message, level = 'info') {
+function log(message, level = 'INFO') {
   const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
-  console.log(logMessage);
-  
-  // Also send critical errors to admin
-  if (level === 'error') {
-    axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-      chat_id: ADMIN_CHAT_ID,
-      text: `🚨 *Error Alert* 🚨\n\n${message}`,
-      parse_mode: 'Markdown'
-    }).catch(e => console.error('Failed to send error alert:', e));
-  }
+  console.log(`[${timestamp}] [${level}] ${message}`);
 }
 
 // Webhook setup endpoint
 app.get('/set-webhook', async (req, res) => {
   try {
-    const url = `${process.env.RAILWAY_PUBLIC_DOMAIN || `http://localhost:${PORT}`}/webhook`;
+    const webhookUrl = `${WEBHOOK_URL}/webhook`;
+    log(`Setting webhook to: ${webhookUrl}`);
+    
     const response = await axios.get(
-      `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${url}`
+      `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${webhookUrl}`
     );
     
+    log('Webhook set successfully, starting deposit monitoring...');
     await startDepositMonitoring();
     
-    res.send({
-      ...response.data,
+    res.json({
+      success: true,
+      webhook_data: response.data,
       monitoring_status: 'Active',
-      webhook_url: url,
-      admin_chat_id: ADMIN_CHAT_ID
+      webhook_url: webhookUrl,
+      admin_chat_id: ADMIN_CHAT_ID,
+      timestamp: new Date().toISOString()
     });
   } catch (error) {
-    log(`Webhook setup failed: ${error.message}`, 'error');
-    res.status(500).send(error.message);
+    log(`Webhook setup failed: ${error.message}`, 'ERROR');
+    stats.errors++;
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
-// Start monitoring deposits
+// Enhanced deposit monitoring with better error handling
 async function startDepositMonitoring() {
   try {
-    await backfillPendingDeposits();
-    
+    // Unsubscribe existing subscription
     if (subscription) {
       subscription.unsubscribe();
+      log('Unsubscribed from existing monitoring');
     }
+
+    // Backfill pending deposits first
+    await backfillPendingDeposits();
     
+    // Start real-time monitoring
     subscription = supabase
-      .channel('deposit-monitor')
+      .channel('deposit-monitor-enhanced')
       .on(
         'postgres_changes',
         {
@@ -87,25 +93,34 @@ async function startDepositMonitoring() {
           table: 'player_transactions',
           filter: 'transaction_type=eq.deposit'
         },
-        (payload) => {
-          if (payload.new.status === 'pending') {
-            stats.totalDeposits++;
-            stats.totalAmount += payload.new.amount;
-            notificationQueue.push(payload.new);
-            processNotificationQueue();
-            log(`New deposit detected: ${payload.new.id}`);
+        async (payload) => {
+          try {
+            log(`New deposit detected: ID ${payload.new.id}`);
+            if (payload.new.status === 'pending') {
+              stats.totalDeposits++;
+              stats.totalAmount += payload.new.amount;
+              notificationQueue.push(payload.new);
+              processNotificationQueue();
+            }
+          } catch (error) {
+            log(`Error processing new deposit: ${error.message}`, 'ERROR');
+            stats.errors++;
           }
         }
       )
-      .subscribe();
-    
+      .subscribe((status) => {
+        log(`Subscription status: ${status}`);
+      });
+
     log('Deposit monitoring started successfully');
   } catch (error) {
-    log(`Failed to start deposit monitoring: ${error.message}`, 'error');
+    log(`Error starting deposit monitoring: ${error.message}`, 'ERROR');
+    stats.errors++;
+    throw error;
   }
 }
 
-// Process pending deposits queue
+// Enhanced notification queue processing
 let notificationQueue = [];
 let isProcessingQueue = false;
 
@@ -113,32 +128,41 @@ async function processNotificationQueue() {
   if (isProcessingQueue || notificationQueue.length === 0) return;
   
   isProcessingQueue = true;
-  const deposit = notificationQueue.shift();
+  log(`Processing notification queue: ${notificationQueue.length} items`);
   
-  try {
-    await sendDepositNotification(deposit);
-    log(`Processed deposit notification: ${deposit.id}`);
-  } catch (error) {
-    log(`Error processing deposit ${deposit.id}: ${error.message}`, 'error');
-    if (deposit.retryCount === undefined) deposit.retryCount = 0;
-    if (deposit.retryCount < 3) {
-      deposit.retryCount++;
-      notificationQueue.push(deposit);
-      log(`Retrying deposit ${deposit.id} (attempt ${deposit.retryCount})`);
-    } else {
-      log(`Max retries reached for deposit ${deposit.id}`, 'error');
+  while (notificationQueue.length > 0) {
+    const deposit = notificationQueue.shift();
+    
+    try {
+      await sendDepositNotification(deposit);
+      log(`Notification sent for deposit ID: ${deposit.id}`);
+    } catch (error) {
+      log(`Error processing deposit ${deposit.id}: ${error.message}`, 'ERROR');
+      stats.errors++;
+      
+      // Retry logic
+      if (!deposit.retryCount) deposit.retryCount = 0;
+      if (deposit.retryCount < 3) {
+        deposit.retryCount++;
+        notificationQueue.push(deposit);
+        log(`Retrying deposit ${deposit.id} (attempt ${deposit.retryCount})`);
+      } else {
+        log(`Max retries reached for deposit ${deposit.id}`, 'ERROR');
+      }
     }
+    
+    // Small delay between notifications
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
   
   isProcessingQueue = false;
-  if (notificationQueue.length > 0) {
-    setTimeout(processNotificationQueue, 500);
-  }
 }
 
-// Backfill any existing pending deposits
+// Enhanced backfill function
 async function backfillPendingDeposits() {
   try {
+    log('Starting backfill of pending deposits...');
+    
     const { data: deposits, error } = await supabase
       .from('player_transactions')
       .select('*')
@@ -148,60 +172,103 @@ async function backfillPendingDeposits() {
 
     if (error) throw error;
 
-    log(`Backfilling ${deposits.length} pending deposits`);
-    notificationQueue.push(...deposits);
-    processNotificationQueue();
+    log(`Found ${deposits.length} pending deposits to backfill`);
+    
+    if (deposits.length > 0) {
+      notificationQueue.push(...deposits);
+      processNotificationQueue();
+    }
   } catch (error) {
-    log(`Backfill error: ${error.message}`, 'error');
+    log(`Backfill error: ${error.message}`, 'ERROR');
+    stats.errors++;
   }
 }
 
-// Enhanced Telegram notification with image proof
+// Enhanced image proof detection and notification
 async function sendDepositNotification(deposit) {
-  // Extract file ID from description (supporting multiple formats)
-  let fileId = null;
-  if (deposit.description) {
-    // Try to extract from "File ID: ..." format
-    const fileIdMatch = deposit.description.match(/File ID: ([a-zA-Z0-9_-]+)/i);
-    if (fileIdMatch) fileId = fileIdMatch[1];
-    
-    // Try to extract direct file ID if description is just the ID
-    if (!fileId && deposit.description.match(/^[a-zA-Z0-9_-]+$/)) {
-      fileId = deposit.description;
-    }
-  }
-
-  const hasImageProof = fileId !== null;
-  
-  const message = `💰 *New Deposit Request* 💰\n\n` +
-                 `🆔 *ID:* ${deposit.id}\n` +
-                 `📱 *Phone:* ${deposit.player_phone}\n` +
-                 `💵 *Amount:* ${deposit.amount.toFixed(2)} ETB\n` +
-                 `📅 *Date:* ${new Date(deposit.created_at).toLocaleString()}\n` +
-                 `📝 *Description:* ${deposit.description || 'None'}\n` +
-                 `📸 *Image Proof:* ${hasImageProof ? '✅ Attached' : '❌ None'}\n\n` +
-                 `_Please review this deposit request_`;
-
-  const keyboard = [
-    [
-      { text: "✅ Approve", callback_data: `approve_${deposit.id}` },
-      { text: "❌ Reject", callback_data: `reject_${deposit.id}` }
-    ],
-    [
-      { text: "📝 View History", callback_data: `history_${deposit.player_phone}` },
-      { text: "📊 User Stats", callback_data: `stats_${deposit.player_phone}` }
-    ]
-  ];
-
-  // Add image viewing button if image proof exists
-  if (hasImageProof) {
-    keyboard.push([
-      { text: "📸 View Image Proof", callback_data: `image_${deposit.id}_${fileId}` }
-    ]);
-  }
-
   try {
-    await axios.post(
+    // Enhanced image proof detection - check multiple possible formats
+    let imageProof = null;
+    let hasImageProof = false;
+
+    if (deposit.description) {
+      // Look for various image proof patterns
+      const patterns = [
+        /File ID:\s*([a-zA-Z0-9_-]+)/i,
+        /file_id:\s*([a-zA-Z0-9_-]+)/i,
+        /image:\s*([a-zA-Z0-9_-]+)/i,
+        /photo:\s*([a-zA-Z0-9_-]+)/i,
+        /proof:\s*([a-zA-Z0-9_-]+)/i
+      ];
+
+      for (const pattern of patterns) {
+        const match = deposit.description.match(pattern);
+        if (match) {
+          imageProof = match[1];
+          hasImageProof = true;
+          break;
+        }
+      }
+    }
+
+    // Check if there's a separate image_proof field
+    if (deposit.image_proof) {
+      imageProof = deposit.image_proof;
+      hasImageProof = true;
+    }
+
+    // Get user information for enhanced display
+    let userInfo = '';
+    try {
+      const { data: user } = await supabase
+        .from('users')
+        .select('username, balance')
+        .eq('phone', deposit.player_phone)
+        .single();
+      
+      if (user) {
+        userInfo = `👤 *Username:* ${user.username}\n💰 *Current Balance:* ${user.balance.toFixed(2)} ETB\n`;
+      }
+    } catch (error) {
+      log(`Could not fetch user info for ${deposit.player_phone}`, 'WARN');
+    }
+
+    const message = `🔔 *NEW DEPOSIT REQUEST* 🔔\n\n` +
+                   `🆔 *Transaction ID:* \`${deposit.id}\`\n` +
+                   `📱 *Phone:* ${deposit.player_phone}\n` +
+                   userInfo +
+                   `💵 *Amount:* ${deposit.amount.toFixed(2)} ETB\n` +
+                   `📅 *Date:* ${new Date(deposit.created_at).toLocaleString('en-US', { timeZone: 'Africa/Addis_Ababa' })}\n` +
+                   `📝 *Description:* ${deposit.description || 'None provided'}\n` +
+                   `📸 *Image Proof:* ${hasImageProof ? '✅ Available' : '❌ None'}\n` +
+                   `⏱️ *Status:* PENDING REVIEW\n\n` +
+                   `_Please review and approve/reject this deposit request_`;
+
+    const keyboard = [
+      [
+        { text: "✅ APPROVE", callback_data: `approve_${deposit.id}` },
+        { text: "❌ REJECT", callback_data: `reject_${deposit.id}` }
+      ],
+      [
+        { text: "📝 History", callback_data: `history_${deposit.player_phone}` },
+        { text: "📊 Stats", callback_data: `stats_${deposit.player_phone}` }
+      ]
+    ];
+
+    // Add image viewing button if image proof exists
+    if (hasImageProof && imageProof) {
+      keyboard.push([
+        { text: "📸 View Image Proof", callback_data: `image_${imageProof}` }
+      ]);
+    }
+
+    // Add quick actions
+    keyboard.push([
+      { text: "🔍 Inspect", callback_data: `inspect_${deposit.id}` },
+      { text: "⚠️ Flag", callback_data: `flag_${deposit.id}` }
+    ]);
+
+    const response = await axios.post(
       `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
       {
         chat_id: ADMIN_CHAT_ID,
@@ -212,13 +279,17 @@ async function sendDepositNotification(deposit) {
         }
       }
     );
+
+    log(`Notification sent successfully for deposit ${deposit.id}`);
+    return response.data;
+
   } catch (error) {
-    log(`Failed to send deposit notification: ${error.message}`, 'error');
+    log(`Error sending notification for deposit ${deposit.id}: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Get user statistics
+// Enhanced user statistics
 async function getUserStats(phone) {
   try {
     const { data: user, error: userError } = await supabase
@@ -232,35 +303,50 @@ async function getUserStats(phone) {
     const { data: transactions, error: txError } = await supabase
       .from('player_transactions')
       .select('*')
-      .eq('player_phone', phone);
+      .eq('player_phone', phone)
+      .order('created_at', { ascending: false });
 
     if (txError) throw txError;
 
     const deposits = transactions.filter(tx => tx.transaction_type === 'deposit');
     const withdrawals = transactions.filter(tx => tx.transaction_type === 'withdrawal');
     const approvedDeposits = deposits.filter(tx => tx.status === 'approved');
+    const pendingDeposits = deposits.filter(tx => tx.status === 'pending');
+    const rejectedDeposits = deposits.filter(tx => tx.status === 'rejected');
+    
     const totalDeposited = approvedDeposits.reduce((sum, tx) => sum + tx.amount, 0);
     const totalWithdrawn = withdrawals.filter(tx => tx.status === 'approved').reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
+    const avgDepositAmount = approvedDeposits.length > 0 ? totalDeposited / approvedDeposits.length : 0;
 
-    return `📊 *User Statistics* 📊\n\n` +
+    // Calculate user activity score
+    const recentTransactions = transactions.filter(tx => 
+      new Date(tx.created_at) > new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+    ).length;
+
+    return `📊 *USER PROFILE & STATISTICS* 📊\n\n` +
            `👤 *Username:* ${user.username || 'N/A'}\n` +
            `📱 *Phone:* ${phone}\n` +
-           `💰 *Current Balance:* ${user.balance?.toFixed(2) || '0.00'} ETB\n` +
-           `📅 *Joined:* ${new Date(user.created_at).toLocaleDateString()}\n\n` +
-           `📈 *Transaction Summary:*\n` +
+           `💰 *Current Balance:* ${user.balance.toFixed(2)} ETB\n` +
+           `📅 *Member Since:* ${new Date(user.created_at).toLocaleDateString()}\n` +
+           `🏃 *Activity Score:* ${recentTransactions}/month\n\n` +
+           `💸 *TRANSACTION SUMMARY:*\n` +
            `• Total Transactions: ${transactions.length}\n` +
-           `• Total Deposits: ${deposits.length}\n` +
-           `• Approved Deposits: ${approvedDeposits.length}\n` +
+           `• Deposits: ${deposits.length} (✅${approvedDeposits.length} ⏳${pendingDeposits.length} ❌${rejectedDeposits.length})\n` +
+           `• Withdrawals: ${withdrawals.length}\n` +
            `• Total Deposited: ${totalDeposited.toFixed(2)} ETB\n` +
            `• Total Withdrawn: ${totalWithdrawn.toFixed(2)} ETB\n` +
-           `• Net Deposit: ${(totalDeposited - totalWithdrawn).toFixed(2)} ETB`;
+           `• Average Deposit: ${avgDepositAmount.toFixed(2)} ETB\n` +
+           `• Net Position: ${(totalDeposited - totalWithdrawn).toFixed(2)} ETB\n\n` +
+           `📈 *RISK ASSESSMENT:*\n` +
+           `• Rejection Rate: ${deposits.length > 0 ? (rejectedDeposits.length / deposits.length * 100).toFixed(1) : 0}%\n` +
+           `• Success Rate: ${deposits.length > 0 ? (approvedDeposits.length / deposits.length * 100).toFixed(1) : 0}%`;
   } catch (error) {
-    log(`Error getting user stats for ${phone}: ${error.message}`, 'error');
+    log(`Error getting user stats for ${phone}: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Get transaction history for a user
+// Enhanced transaction history
 async function getTransactionHistory(phone) {
   try {
     const { data: transactions, error } = await supabase
@@ -268,37 +354,56 @@ async function getTransactionHistory(phone) {
       .select('*')
       .eq('player_phone', phone)
       .order('created_at', { ascending: false })
-      .limit(10);
+      .limit(15);
       
     if (error) throw error;
     
-    let message = `📝 *Transaction History* 📝\n\n` +
-                 `📱 *Phone:* ${phone}\n\n`;
+    let message = `📝 *TRANSACTION HISTORY* 📝\n\n` +
+                 `📱 *Phone:* ${phone}\n` +
+                 `🔢 *Showing:* Last ${Math.min(transactions.length, 15)} transactions\n\n`;
                  
     if (transactions.length === 0) {
-      message += `No transactions found.`;
+      message += `❌ No transactions found for this user.`;
     } else {
       transactions.forEach((tx, index) => {
-        const emoji = tx.transaction_type === 'deposit' ? '💰' : '💸';
-        const statusEmoji = tx.status === 'approved' ? '✅' : (tx.status === 'rejected' ? '❌' : '⏳');
+        const typeEmoji = tx.transaction_type === 'deposit' ? '💰' : '💸';
+        const statusEmoji = tx.status === 'approved' ? '✅' : 
+                           tx.status === 'rejected' ? '❌' : '⏳';
         
-        message += `${emoji} *${tx.transaction_type.toUpperCase()}* ${statusEmoji}\n` +
-                   `💵 Amount: ${tx.amount.toFixed(2)} ETB\n` +
-                   `📅 Date: ${new Date(tx.created_at).toLocaleString()}\n` +
-                   `📝 Desc: ${tx.description?.substring(0, 50) || 'None'}${tx.description?.length > 50 ? '...' : ''}\n`;
+        const amount = tx.transaction_type === 'deposit' ? 
+                      `+${tx.amount.toFixed(2)}` : 
+                      `${tx.amount.toFixed(2)}`;
         
-        if (index < transactions.length - 1) message += `----------------------------\n`;
+        message += `${typeEmoji} *${tx.transaction_type.toUpperCase()}* ${statusEmoji}\n` +
+                   `💵 ${amount} ETB\n` +
+                   `📅 ${new Date(tx.created_at).toLocaleString()}\n` +
+                   `🆔 ID: \`${tx.id}\`\n`;
+        
+        if (tx.description) {
+          const shortDesc = tx.description.length > 40 ? 
+                           tx.description.substring(0, 40) + '...' : 
+                           tx.description;
+          message += `📝 ${shortDesc}\n`;
+        }
+        
+        if (index < transactions.length - 1) {
+          message += `➖➖➖➖➖➖➖➖➖➖\n`;
+        }
       });
+      
+      message += `\n📊 *Quick Stats:* ${transactions.filter(tx => tx.status === 'approved').length} approved, ` +
+                `${transactions.filter(tx => tx.status === 'pending').length} pending, ` +
+                `${transactions.filter(tx => tx.status === 'rejected').length} rejected`;
     }
     
     return message;
   } catch (error) {
-    log(`Error getting transaction history for ${phone}: ${error.message}`, 'error');
+    log(`Error getting transaction history for ${phone}: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Get system statistics
+// Enhanced system statistics
 async function getSystemStats() {
   try {
     const { data: allTransactions, error } = await supabase
@@ -315,74 +420,128 @@ async function getSystemStats() {
     const rejectedDeposits = deposits.filter(tx => tx.status === 'rejected');
 
     const totalDepositAmount = approvedDeposits.reduce((sum, tx) => sum + tx.amount, 0);
-    const totalWithdrawalAmount = withdrawals.filter(tx => tx.status === 'approved').reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
+    const totalWithdrawalAmount = withdrawals
+      .filter(tx => tx.status === 'approved')
+      .reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
 
-    return `📊 *System Statistics (24h)* 📊\n\n` +
-           `⏰ *Uptime:* ${Math.floor((Date.now() - stats.startTime.getTime()) / (1000 * 60 * 60))}h ${Math.floor(((Date.now() - stats.startTime.getTime()) % (1000 * 60 * 60)) / (1000 * 60))}m\n\n` +
-           `💰 *Deposits:*\n` +
-           `• Total: ${deposits.length}\n` +
-           `• Pending: ${pendingDeposits.length}\n` +
-           `• Approved: ${approvedDeposits.length}\n` +
-           `• Rejected: ${rejectedDeposits.length}\n` +
-           `• Total Amount: ${totalDepositAmount.toFixed(2)} ETB\n\n` +
-           `💸 *Withdrawals:*\n` +
+    const uptime = Date.now() - stats.startTime.getTime();
+    const uptimeHours = Math.floor(uptime / (1000 * 60 * 60));
+    const uptimeMinutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
+
+    return `📊 *SYSTEM DASHBOARD (24H)* 📊\n\n` +
+           `⏰ *Uptime:* ${uptimeHours}h ${uptimeMinutes}m\n` +
+           `🔄 *Queue:* ${notificationQueue.length} pending\n` +
+           `❌ *Errors:* ${stats.errors}\n` +
+           `📡 *Status:* ${subscription ? 'Connected' : 'Disconnected'}\n\n` +
+           `💰 *DEPOSITS (24H):*\n` +
+           `• Total Requests: ${deposits.length}\n` +
+           `• ⏳ Pending: ${pendingDeposits.length}\n` +
+           `• ✅ Approved: ${approvedDeposits.length} (${totalDepositAmount.toFixed(2)} ETB)\n` +
+           `• ❌ Rejected: ${rejectedDeposits.length}\n` +
+           `• 📈 Success Rate: ${deposits.length > 0 ? (approvedDeposits.length / deposits.length * 100).toFixed(1) : 0}%\n\n` +
+           `💸 *WITHDRAWALS (24H):*\n` +
            `• Total: ${withdrawals.length}\n` +
-           `• Total Amount: ${totalWithdrawalAmount.toFixed(2)} ETB\n\n` +
-           `📈 *Net Flow:* ${(totalDepositAmount - totalWithdrawalAmount).toFixed(2)} ETB\n` +
-           `🔄 *Queue:* ${notificationQueue.length} pending notifications`;
+           `• Amount: ${totalWithdrawalAmount.toFixed(2)} ETB\n\n` +
+           `📈 *NET FLOW:* ${(totalDepositAmount - totalWithdrawalAmount).toFixed(2)} ETB\n` +
+           `🎯 *Performance:* ${(100 - (stats.errors / Math.max(1, stats.totalDeposits) * 100)).toFixed(1)}% success`;
   } catch (error) {
-    log(`Error getting system stats: ${error.message}`, 'error');
+    log(`Error getting system stats: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Send image proof to admin
-async function sendImageProof(fileId, depositId) {
+// Enhanced image proof viewing
+async function sendImageProof(fileId) {
   try {
+    log(`Sending image proof with file ID: ${fileId}`);
+    
     const response = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
       chat_id: ADMIN_CHAT_ID,
       photo: fileId,
-      caption: `📸 *Deposit Image Proof*\n\n` +
-               `Deposit ID: ${depositId}\n` +
-               `This is the image proof submitted by the user for their deposit request.`,
+      caption: '📸 *DEPOSIT IMAGE PROOF*\n\n' +
+               '👆 This image was submitted as proof for the deposit request.\n' +
+               '🔍 Please verify the transaction details match the request.',
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Looks Good", callback_data: `proof_ok_${fileId}` },
+          { text: "❌ Suspicious", callback_data: `proof_bad_${fileId}` }
+        ]]
+      }
+    });
+    
+    log('Image proof sent successfully');
+    return response.data;
+  } catch (error) {
+    log(`Error sending image proof: ${error.message}`, 'ERROR');
+    
+    // Try to send error message to admin
+    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      chat_id: ADMIN_CHAT_ID,
+      text: `❌ *Error Loading Image Proof*\n\n` +
+            `File ID: \`${fileId}\`\n` +
+            `Error: ${error.message}\n\n` +
+            `The image may have expired or the file ID is invalid.`,
       parse_mode: 'Markdown'
     });
     
-    return response.data.result.photo[0].file_id; // Return the new file ID
-  } catch (error) {
-    log(`Error sending image proof: ${error.message}`, 'error');
-    
-    // If sending photo fails, try sending as document
-    try {
-      const response = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
-        chat_id: ADMIN_CHAT_ID,
-        document: fileId,
-        caption: `📸 *Deposit Image Proof (Sent as Document)*\n\n` +
-                 `Deposit ID: ${depositId}\n` +
-                 `This is the image proof submitted by the user for their deposit request.`,
-        parse_mode: 'Markdown'
-      });
-      
-      return response.data.result.document.file_id; // Return the new file ID
-    } catch (docError) {
-      log(`Failed to send image as document: ${docError.message}`, 'error');
-      throw docError;
-    }
+    throw error;
   }
 }
 
-// Main webhook handler
+// Enhanced transaction inspection
+async function inspectTransaction(txId) {
+  try {
+    const { data: transaction, error } = await supabase
+      .from('player_transactions')
+      .select('*')
+      .eq('id', txId)
+      .single();
+
+    if (error || !transaction) {
+      throw new Error('Transaction not found');
+    }
+
+    // Get related transactions from same user
+    const { data: relatedTxs } = await supabase
+      .from('player_transactions')
+      .select('*')
+      .eq('player_phone', transaction.player_phone)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    const message = `🔍 *TRANSACTION INSPECTION* 🔍\n\n` +
+                   `🆔 *ID:* \`${transaction.id}\`\n` +
+                   `📱 *Phone:* ${transaction.player_phone}\n` +
+                   `💵 *Amount:* ${transaction.amount.toFixed(2)} ETB\n` +
+                   `📅 *Created:* ${new Date(transaction.created_at).toLocaleString()}\n` +
+                   `⏱️ *Status:* ${transaction.status.toUpperCase()}\n` +
+                   `📝 *Description:* ${transaction.description || 'None'}\n\n` +
+                   `📊 *RECENT ACTIVITY:*\n` +
+                   relatedTxs.slice(0, 3).map((tx, i) => 
+                     `${i + 1}. ${tx.transaction_type} ${tx.amount.toFixed(2)} ETB (${tx.status})`
+                   ).join('\n') +
+                   `\n\n🚨 *FLAGS:* None detected`;
+
+    return message;
+  } catch (error) {
+    log(`Error inspecting transaction ${txId}: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+// MAIN WEBHOOK HANDLER - Enhanced with better error handling
 app.post('/webhook', async (req, res) => {
   try {
     const update = req.body;
-    
-    // Log incoming update for debugging
-    log(`Incoming update: ${JSON.stringify(update)}`, 'debug');
+    log(`Received webhook update: ${JSON.stringify(update).substring(0, 200)}...`);
     
     // Handle callback queries (button presses)
     if (update.callback_query) {
-      const [action, ...rest] = update.callback_query.data.split('_');
-      const identifier = rest.join('_'); // Handle cases where ID might contain underscores
+      const callbackData = update.callback_query.data;
+      const [action, identifier] = callbackData.split('_');
+      
+      log(`Processing callback: ${action} - ${identifier}`);
       
       // Handle approve/reject actions
       if (action === 'approve' || action === 'reject') {
@@ -390,10 +549,10 @@ app.post('/webhook', async (req, res) => {
         
         // Prevent duplicate processing
         if (processingTransactions.has(txId)) {
-          log(`Transaction ${txId} is already being processed`);
+          log(`Transaction ${txId} already being processed`);
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Transaction is already being processed!`,
+            text: `⚠️ Transaction is already being processed!`,
             show_alert: true
           });
           return res.send('OK');
@@ -403,10 +562,10 @@ app.post('/webhook', async (req, res) => {
         log(`Processing transaction ${txId} (${action})`);
         
         try {
-          // Check current transaction status
+          // Get current transaction
           const { data: currentTx, error: txError } = await supabase
             .from('player_transactions')
-            .select('status, player_phone, amount, description')
+            .select('*')
             .eq('id', txId)
             .single();
             
@@ -417,33 +576,26 @@ app.post('/webhook', async (req, res) => {
           if (currentTx.status !== 'pending') {
             await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
               callback_query_id: update.callback_query.id,
-              text: `Transaction already ${currentTx.status}!`,
+              text: `⚠️ Transaction already ${currentTx.status}!`,
               show_alert: true
             });
             return res.send('OK');
           }
           
-          const status = action === 'approve' ? 'approved' : 'rejected';
+          const newStatus = action === 'approve' ? 'approved' : 'rejected';
           let newBalance = null;
           
-          // Update transaction status
+          // Start database transaction
           const { error: updateError } = await supabase
             .from('player_transactions')
             .update({ 
-              status,
+              status: newStatus,
               processed_at: new Date().toISOString(),
               processed_by: 'Admin Bot'
             })
             .eq('id', txId);
             
           if (updateError) throw updateError;
-          
-          // Update statistics
-          if (action === 'approve') {
-            stats.approvedDeposits++;
-          } else {
-            stats.rejectedDeposits++;
-          }
           
           // Update user balance if approved
           if (action === 'approve') {
@@ -463,15 +615,23 @@ app.post('/webhook', async (req, res) => {
               .eq('phone', currentTx.player_phone);
               
             if (balanceError) throw balanceError;
+            
+            stats.approvedDeposits++;
+            log(`Approved deposit ${txId}, new balance: ${newBalance.toFixed(2)} ETB`);
+          } else {
+            stats.rejectedDeposits++;
+            log(`Rejected deposit ${txId}`);
           }
           
-          // Update Telegram message
+          // Update message with new status
+          const statusEmoji = action === 'approve' ? '✅' : '❌';
           const newMessage = `${update.callback_query.message.text}\n\n` +
-                           `✅ *Status:* ${status.toUpperCase()}\n` +
-                           `⏱ *Processed At:* ${new Date().toLocaleString()}\n` +
-                           `👤 *Processed By:* Admin Bot\n` +
+                           `${statusEmoji} *FINAL STATUS:* ${newStatus.toUpperCase()}\n` +
+                           `⏱️ *Processed:* ${new Date().toLocaleString()}\n` +
+                           `🤖 *By:* Admin Bot\n` +
                            (action === 'approve' ? 
-                            `💰 *New Balance:* ${newBalance?.toFixed(2) || currentTx.amount.toFixed(2)} ETB` : '');
+                            `💰 *New Balance:* ${newBalance.toFixed(2)} ETB` : 
+                            `📝 *Reason:* Manual rejection by admin`);
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
             chat_id: update.callback_query.message.chat.id,
@@ -483,64 +643,41 @@ app.post('/webhook', async (req, res) => {
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Transaction ${status} successfully!`,
+            text: `${statusEmoji} Transaction ${newStatus} successfully!`,
             show_alert: false
           });
           
-          // Send confirmation to user if possible
-          try {
-            const { data: user, error: userError } = await supabase
-              .from('users')
-              .select('telegram_chat_id')
-              .eq('phone', currentTx.player_phone)
-              .single();
-              
-            if (!userError && user?.telegram_chat_id) {
-              const userMessage = `Your deposit request has been ${status}!\n\n` +
-                                `💵 Amount: ${currentTx.amount.toFixed(2)} ETB\n` +
-                                (action === 'approve' ? 
-                                 `💰 New Balance: ${newBalance.toFixed(2)} ETB\n` : '') +
-                                `📅 Processed At: ${new Date().toLocaleString()}\n\n` +
-                                `Thank you for using our service!`;
-              
-              await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-                chat_id: user.telegram_chat_id,
-                text: userMessage,
-                parse_mode: 'Markdown'
-              });
-            }
-          } catch (userNotifyError) {
-            log(`Failed to notify user: ${userNotifyError.message}`, 'error');
-          }
-          
         } catch (error) {
-          log(`Error processing transaction ${txId}: ${error.message}`, 'error');
+          log(`Error processing transaction ${txId}: ${error.message}`, 'ERROR');
+          stats.errors++;
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             chat_id: ADMIN_CHAT_ID,
-            text: `❌ Error processing transaction ${txId}:\n\n<code>${error.message}</code>`,
-            parse_mode: 'HTML'
+            text: `❌ *ERROR PROCESSING TRANSACTION*\n\n` +
+                  `🆔 *ID:* \`${txId}\`\n` +
+                  `⚠️ *Error:* ${error.message}\n` +
+                  `🕐 *Time:* ${new Date().toLocaleString()}\n\n` +
+                  `Please check the transaction manually.`,
+            parse_mode: 'Markdown'
           });
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Error: ${error.message.substring(0, 50)}...`,
+            text: `❌ Error: ${error.message.substring(0, 50)}...`,
             show_alert: true
           });
         } finally {
           processingTransactions.delete(txId);
         }
       }
-      // Handle history request
+      // Handle other callback actions
       else if (action === 'history') {
-        const phone = identifier;
-        
         try {
-          const history = await getTransactionHistory(phone);
+          const history = await getTransactionHistory(identifier);
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Showing transaction history for ${phone}`,
+            text: `📝 Loading transaction history...`,
             show_alert: false
           });
           
@@ -550,24 +687,21 @@ app.post('/webhook', async (req, res) => {
             parse_mode: 'Markdown'
           });
         } catch (error) {
-          log(`Error fetching history: ${error.message}`, 'error');
+          log(`Error fetching history for ${identifier}: ${error.message}`, 'ERROR');
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Error loading history!`,
+            text: `❌ Error loading history!`,
             show_alert: true
           });
         }
       }
-      // Handle user stats request
       else if (action === 'stats') {
-        const phone = identifier;
-        
         try {
-          const userStats = await getUserStats(phone);
+          const userStats = await getUserStats(identifier);
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Showing user statistics for ${phone}`,
+            text: `📊 Loading user statistics...`,
             show_alert: false
           });
           
@@ -577,48 +711,127 @@ app.post('/webhook', async (req, res) => {
             parse_mode: 'Markdown'
           });
         } catch (error) {
-          log(`Error fetching user stats: ${error.message}`, 'error');
+          log(`Error fetching stats for ${identifier}: ${error.message}`, 'ERROR');
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Error loading user stats!`,
+            text: `❌ Error loading user stats!`,
             show_alert: true
           });
         }
       }
-      // Handle image proof viewing
       else if (action === 'image') {
-        const [depositId, fileId] = identifier.split('_');
-        
         try {
-          await sendImageProof(fileId, depositId);
+          await sendImageProof(identifier);
           
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Image proof sent!`,
+            text: `📸 Image proof sent!`,
             show_alert: false
           });
         } catch (error) {
-          log(`Error sending image proof: ${error.message}`, 'error');
+          log(`Error sending image proof ${identifier}: ${error.message}`, 'ERROR');
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             callback_query_id: update.callback_query.id,
-            text: `Error loading image proof!`,
+            text: `❌ Error loading image proof!`,
             show_alert: true
           });
         }
+      }
+      else if (action === 'inspect') {
+        try {
+          const inspection = await inspectTransaction(identifier);
+          
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+            callback_query_id: update.callback_query.id,
+            text: `🔍 Transaction inspection loaded`,
+            show_alert: false
+          });
+          
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: ADMIN_CHAT_ID,
+            text: inspection,
+            parse_mode: 'Markdown'
+          });
+        } catch (error) {
+          log(`Error inspecting transaction ${identifier}: ${error.message}`, 'ERROR');
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+            callback_query_id: update.callback_query.id,
+            text: `❌ Error loading inspection!`,
+            show_alert: true
+          });
+        }
+      }
+      else if (action === 'flag') {
+        try {
+          // Flag transaction for manual review
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: ADMIN_CHAT_ID,
+            text: `🚩 *TRANSACTION FLAGGED* 🚩\n\n` +
+                  `🆔 *ID:* \`${identifier}\`\n` +
+                  `⚠️ *Status:* Flagged for manual review\n` +
+                  `👤 *Flagged by:* Admin\n` +
+                  `🕐 *Time:* ${new Date().toLocaleString()}\n\n` +
+                  `This transaction requires additional verification.`,
+            parse_mode: 'Markdown'
+          });
+          
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+            callback_query_id: update.callback_query.id,
+            text: `🚩 Transaction flagged for review`,
+            show_alert: false
+          });
+        } catch (error) {
+          log(`Error flagging transaction ${identifier}: ${error.message}`, 'ERROR');
+        }
+      }
+      else if (action === 'proof') {
+        // Handle proof verification feedback
+        const [status, fileId] = callbackData.split('_').slice(1);
+        const message = status === 'ok' ? 
+          '✅ Image proof verified as legitimate' : 
+          '⚠️ Image proof marked as suspicious';
+        
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          callback_query_id: update.callback_query.id,
+          text: message,
+          show_alert: false
+        });
       }
     }
     
     // Handle text commands
     if (update.message && update.message.text) {
-      const text = update.message.text.toLowerCase();
+      const text = update.message.text.toLowerCase().trim();
       const chatId = update.message.chat.id;
       
       // Only respond to admin
       if (chatId.toString() !== ADMIN_CHAT_ID) {
+        log(`Unauthorized access attempt from chat ID: ${chatId}`);
         return res.send('OK');
       }
       
-      if (text === '/stats' || text === '/statistics') {
+      log(`Admin command received: ${text}`);
+      
+      if (text === '/start') {
+        const welcomeMessage = `🤖 *ADMIN BOT ACTIVATED* 🤖\n\n` +
+                              `Welcome to the Enhanced Deposit Management System!\n\n` +
+                              `🔧 *Available Commands:*\n` +
+                              `• /help - Show all commands\n` +
+                              `• /stats - System statistics\n` +
+                              `• /pending - Show pending deposits\n` +
+                              `• /restart - Restart monitoring\n` +
+                              `• /health - System health check\n\n` +
+                              `✅ *Bot Status:* Active and monitoring\n` +
+                              `📡 *Connection:* ${subscription ? 'Connected' : 'Disconnected'}\n` +
+                              `⏰ *Started:* ${stats.startTime.toLocaleString()}`;
+        
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          chat_id: ADMIN_CHAT_ID,
+          text: welcomeMessage,
+          parse_mode: 'Markdown'
+        });
+      }
+      else if (text === '/stats' || text === '/statistics') {
         try {
           const systemStats = await getSystemStats();
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -627,24 +840,37 @@ app.post('/webhook', async (req, res) => {
             parse_mode: 'Markdown'
           });
         } catch (error) {
-          log(`Error getting system stats: ${error.message}`, 'error');
+          log(`Error getting system stats: ${error.message}`, 'ERROR');
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: ADMIN_CHAT_ID,
+            text: `❌ Error loading system statistics: ${error.message}`
+          });
         }
       }
-      
-      if (text === '/help') {
-        const helpMessage = `🤖 *Admin Bot Commands* 🤖\n\n` +
-                           `📊 /stats - View system statistics\n` +
-                           `❓ /help - Show this help message\n` +
-                           `🔄 /restart - Restart monitoring\n` +
-                           `📋 /pending - Show pending deposits\n` +
-                           `👤 /user <phone> - Get user info\n\n` +
-                           `*Automatic Features:*\n` +
+      else if (text === '/help') {
+        const helpMessage = `🤖 *ADMIN BOT HELP CENTER* 🤖\n\n` +
+                           `📊 *SYSTEM COMMANDS:*\n` +
+                           `• \`/stats\` - View system statistics\n` +
+                           `• \`/health\` - System health check\n` +
+                           `• \`/restart\` - Restart monitoring\n` +
+                           `• \`/pending\` - Show pending deposits\n` +
+                           `• \`/recent\` - Recent transactions\n\n` +
+                           `🔍 *SEARCH COMMANDS:*\n` +
+                           `• \`/user [phone]\` - User information\n` +
+                           `• \`/tx [id]\` - Transaction details\n` +
+                           `• \`/find [amount]\` - Find by amount\n\n` +
+                           `⚙️ *ADMIN COMMANDS:*\n` +
+                           `• \`/config\` - Bot configuration\n` +
+                           `• \`/logs\` - Error logs\n` +
+                           `• \`/reset\` - Reset statistics\n\n` +
+                           `🔄 *AUTOMATIC FEATURES:*\n` +
                            `• Real-time deposit notifications\n` +
-                           `• Image proof viewing\n` +
-                           `• User transaction history\n` +
-                           `• User statistics\n` +
-                           `• Approve/Reject with one click\n` +
-                           `• User notifications for approved/rejected deposits`;
+                           `• Enhanced image proof viewing\n` +
+                           `• User statistics and history\n` +
+                           `• One-click approve/reject\n` +
+                           `• Transaction inspection\n` +
+                           `• Fraud detection alerts\n\n` +
+                           `💡 *TIP:* Use inline buttons for faster processing!`;
         
         await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           chat_id: ADMIN_CHAT_ID,
@@ -652,20 +878,22 @@ app.post('/webhook', async (req, res) => {
           parse_mode: 'Markdown'
         });
       }
-      
-      if (text === '/restart') {
+      else if (text === '/restart') {
         try {
           await startDepositMonitoring();
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             chat_id: ADMIN_CHAT_ID,
-            text: '🔄 Monitoring restarted successfully!'
+            text: '🔄 *SYSTEM RESTARTED*\n\n✅ Monitoring restarted successfully!\n📡 All systems operational.'
           });
         } catch (error) {
-          log(`Error restarting monitoring: ${error.message}`, 'error');
+          log(`Error restarting monitoring: ${error.message}`, 'ERROR');
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: ADMIN_CHAT_ID,
+            text: `❌ Error restarting monitoring: ${error.message}`
+          });
         }
       }
-      
-      if (text === '/pending') {
+      else if (text === '/pending') {
         try {
           const { data: pendingDeposits, error } = await supabase
             .from('player_transactions')
@@ -673,41 +901,95 @@ app.post('/webhook', async (req, res) => {
             .eq('status', 'pending')
             .eq('transaction_type', 'deposit')
             .order('created_at', { ascending: false })
-            .limit(5);
+            .limit(10);
           
           if (error) throw error;
           
           if (pendingDeposits.length === 0) {
             await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
               chat_id: ADMIN_CHAT_ID,
-              text: '✅ No pending deposits!'
+              text: '✅ *NO PENDING DEPOSITS*\n\nAll deposits have been processed!'
             });
           } else {
             await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
               chat_id: ADMIN_CHAT_ID,
-              text: `📋 Found ${pendingDeposits.length} pending deposits:`
+              text: `📋 *FOUND ${pendingDeposits.length} PENDING DEPOSITS*\n\nSending notifications...`
             });
             
             for (const deposit of pendingDeposits) {
               await sendDepositNotification(deposit);
-              await new Promise(resolve => setTimeout(resolve, 500)); // Rate limiting
+              await new Promise(resolve => setTimeout(resolve, 1000)); // Delay between notifications
             }
           }
         } catch (error) {
-          log(`Error fetching pending deposits: ${error.message}`, 'error');
-        }
-      }
-      
-      if (text.startsWith('/user ')) {
-        const phone = text.split(' ')[1];
-        if (!phone) {
+          log(`Error fetching pending deposits: ${error.message}`, 'ERROR');
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             chat_id: ADMIN_CHAT_ID,
-            text: 'Please provide a phone number: /user 0912345678'
+            text: `❌ Error fetching pending deposits: ${error.message}`
           });
-          return;
         }
+      }
+      else if (text === '/health') {
+        const healthStatus = {
+          bot_status: '✅ Online',
+          database: subscription ? '✅ Connected' : '❌ Disconnected',
+          webhook: '✅ Active',
+          queue_size: notificationQueue.length,
+          uptime: Math.floor((Date.now() - stats.startTime.getTime()) / (1000 * 60 * 60)),
+          errors: stats.errors,
+          last_activity: new Date().toLocaleString()
+        };
         
+        const healthMessage = `🏥 *SYSTEM HEALTH CHECK* 🏥\n\n` +
+                             `🤖 *Bot Status:* ${healthStatus.bot_status}\n` +
+                             `🗄️ *Database:* ${healthStatus.database}\n` +
+                             `📡 *Webhook:* ${healthStatus.webhook}\n` +
+                             `📊 *Queue Size:* ${healthStatus.queue_size}\n` +
+                             `⏰ *Uptime:* ${healthStatus.uptime} hours\n` +
+                             `❌ *Total Errors:* ${healthStatus.errors}\n` +
+                             `🕐 *Last Check:* ${healthStatus.last_activity}\n\n` +
+                             `${healthStatus.errors === 0 ? '💚 All systems healthy!' : '⚠️ Some issues detected'}`;
+        
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          chat_id: ADMIN_CHAT_ID,
+          text: healthMessage,
+          parse_mode: 'Markdown'
+        });
+      }
+      else if (text === '/recent') {
+        try {
+          const { data: recentTxs, error } = await supabase
+            .from('player_transactions')
+            .select('*')
+            .eq('transaction_type', 'deposit')
+            .order('created_at', { ascending: false })
+            .limit(5);
+          
+          if (error) throw error;
+          
+          let message = `🕐 *RECENT TRANSACTIONS* 🕐\n\n`;
+          if (recentTxs.length === 0) {
+            message += 'No recent transactions found.';
+          } else {
+            recentTxs.forEach((tx, i) => {
+              const statusEmoji = tx.status === 'approved' ? '✅' : 
+                                 tx.status === 'rejected' ? '❌' : '⏳';
+              message += `${i + 1}. ${statusEmoji} ${tx.amount.toFixed(2)} ETB\n` +
+                        `   📱 ${tx.player_phone} | ${new Date(tx.created_at).toLocaleString()}\n\n`;
+            });
+          }
+          
+          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: ADMIN_CHAT_ID,
+            text: message,
+            parse_mode: 'Markdown'
+          });
+        } catch (error) {
+          log(`Error fetching recent transactions: ${error.message}`, 'ERROR');
+        }
+      }
+      else if (text.startsWith('/user ')) {
+        const phone = text.replace('/user ', '').trim();
         try {
           const userStats = await getUserStats(phone);
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -716,91 +998,228 @@ app.post('/webhook', async (req, res) => {
             parse_mode: 'Markdown'
           });
         } catch (error) {
-          log(`Error getting user info for ${phone}: ${error.message}`, 'error');
+          log(`Error fetching user stats for ${phone}: ${error.message}`, 'ERROR');
           await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             chat_id: ADMIN_CHAT_ID,
-            text: `Error getting user info for ${phone}`
+            text: `❌ User not found or error: ${error.message}`
           });
         }
+      }
+      else if (text === '/config') {
+        const configMessage = `⚙️ *BOT CONFIGURATION* ⚙️\n\n` +
+                             `🤖 *Bot Token:* ${BOT_TOKEN.substring(0, 10)}...\n` +
+                             `👤 *Admin Chat ID:* ${ADMIN_CHAT_ID}\n` +
+                             `🌐 *Webhook URL:* ${WEBHOOK_URL}/webhook\n` +
+                             `🗄️ *Database:* ${SUPABASE_URL}\n` +
+                             `🚀 *Port:* ${PORT}\n` +
+                             `📊 *Monitoring:* ${subscription ? 'Active' : 'Inactive'}\n\n` +
+                             `⚡ *Performance Settings:*\n` +
+                             `• Queue Processing: Enabled\n` +
+                             `• Retry Attempts: 3\n` +
+                             `• Notification Delay: 500ms\n` +
+                             `• Auto Backfill: Enabled`;
+        
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          chat_id: ADMIN_CHAT_ID,
+          text: configMessage,
+          parse_mode: 'Markdown'
+        });
       }
     }
     
     res.send('OK');
   } catch (error) {
-    log(`Webhook processing error: ${error.message}`, 'error');
+    log(`Webhook processing error: ${error.message}`, 'ERROR');
+    stats.errors++;
     res.status(500).send('Error processing request');
   }
 });
 
-// Health check endpoint
+// Enhanced health check endpoint
 app.get('/', (req, res) => {
-  res.send(`
-    <h1>🤖 Enhanced Deposit Approval System</h1>
-    <p><strong>Server Status:</strong> ✅ Running</p>
-    <p><strong>Uptime:</strong> ${Math.floor((Date.now() - stats.startTime.getTime()) / (1000 * 60))} minutes</p>
-    
-    <h2>📊 Statistics</h2>
-    <ul>
-      <li><strong>Total Deposits:</strong> ${stats.totalDeposits}</li>
-      <li><strong>Approved:</strong> ${stats.approvedDeposits}</li>
-      <li><strong>Rejected:</strong> ${stats.rejectedDeposits}</li>
-      <li><strong>Total Amount:</strong> ${stats.totalAmount.toFixed(2)} ETB</li>
-    </ul>
-    
-    <h2>🔧 System Info</h2>
-    <ul>
-      <li><a href="/set-webhook">🔗 Setup Webhook</a></li>
-      <li><strong>Webhook URL:</strong> <code>/webhook</code></li>
-      <li><strong>Monitoring Status:</strong> ${subscription ? '✅ Active' : '❌ Inactive'}</li>
-      <li><strong>Pending Notifications:</strong> ${notificationQueue.length}</li>
-      <li><strong>Processing Transactions:</strong> ${processingTransactions.size}</li>
-      <li><strong>Admin Chat ID:</strong> ${ADMIN_CHAT_ID}</li>
-    </ul>
-    
-    <h2>✨ Features</h2>
-    <ul>
-      <li>📸 Image proof viewing</li>
-      <li>📊 User statistics</li>
-      <li>📝 Transaction history</li>
-      <li>⚡ Real-time notifications</li>
-      <li>🔄 Auto-retry failed notifications</li>
-      <li>📈 System statistics</li>
-      <li>👤 User notifications</li>
-      <li>🔍 Enhanced logging</li>
-    </ul>
-  `);
+  const healthData = {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor((Date.now() - stats.startTime.getTime()) / 1000),
+    version: '2.0.0-enhanced',
+    stats: {
+      total_deposits: stats.totalDeposits,
+      approved_deposits: stats.approvedDeposits,
+      rejected_deposits: stats.rejectedDeposits,
+      total_amount: stats.totalAmount,
+      errors: stats.errors,
+      queue_size: notificationQueue.length
+    },
+    services: {
+      bot: 'online',
+      database: subscription ? 'connected' : 'disconnected',
+      webhook: 'active'
+    }
+  };
+  
+  res.json(healthData);
 });
 
-// Scheduled tasks
+// API endpoint to get statistics (for external monitoring)
+app.get('/api/stats', (req, res) => {
+  res.json({
+    success: true,
+    data: stats,
+    uptime: Date.now() - stats.startTime.getTime(),
+    queue_size: notificationQueue.length,
+    monitoring_active: !!subscription
+  });
+});
+
+// API endpoint to manually trigger pending check
+app.post('/api/check-pending', async (req, res) => {
+  try {
+    await backfillPendingDeposits();
+    res.json({
+      success: true,
+      message: 'Pending deposits check triggered',
+      queue_size: notificationQueue.length
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Scheduled tasks - Enhanced reporting
 cron.schedule('0 */6 * * *', async () => {
-  log('Running scheduled maintenance...');
+  log('Running scheduled maintenance and reporting...');
   try {
     const systemStats = await getSystemStats();
     await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       chat_id: ADMIN_CHAT_ID,
-      text: `🔄 *Scheduled Report*\n\n${systemStats}`,
+      text: `🔄 *SCHEDULED SYSTEM REPORT*\n\n${systemStats}`,
+      parse_mode: 'Markdown'
+    });
+    
+    // Clear old processed transactions from memory if any
+    if (processingTransactions.size > 100) {
+      processingTransactions.clear();
+      log('Cleared processing transactions cache');
+    }
+  } catch (error) {
+    log(`Scheduled task error: ${error.message}`, 'ERROR');
+    stats.errors++;
+  }
+});
+
+// Daily summary report
+cron.schedule('0 9 * * *', async () => {
+  log('Sending daily summary report...');
+  try {
+    const { data: dailyTxs, error } = await supabase
+      .from('player_transactions')
+      .select('*')
+      .eq('transaction_type', 'deposit')
+      .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    
+    if (error) throw error;
+    
+    const approved = dailyTxs.filter(tx => tx.status === 'approved');
+    const rejected = dailyTxs.filter(tx => tx.status === 'rejected');
+    const pending = dailyTxs.filter(tx => tx.status === 'pending');
+    
+    const totalAmount = approved.reduce((sum, tx) => sum + tx.amount, 0);
+    
+    const summaryMessage = `📅 *DAILY SUMMARY REPORT* 📅\n\n` +
+                          `📊 *Yesterday's Activity:*\n` +
+                          `• Total Deposits: ${dailyTxs.length}\n` +
+                          `• ✅ Approved: ${approved.length} (${totalAmount.toFixed(2)} ETB)\n` +
+                          `• ❌ Rejected: ${rejected.length}\n` +
+                          `• ⏳ Still Pending: ${pending.length}\n\n` +
+                          `📈 *Performance:*\n` +
+                          `• Success Rate: ${dailyTxs.length > 0 ? (approved.length / dailyTxs.length * 100).toFixed(1) : 0}%\n` +
+                          `• Average Amount: ${approved.length > 0 ? (totalAmount / approved.length).toFixed(2) : 0} ETB\n` +
+                          `• System Errors: ${stats.errors}\n\n` +
+                          `Have a great day! 🌅`;
+    
+    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      chat_id: ADMIN_CHAT_ID,
+      text: summaryMessage,
       parse_mode: 'Markdown'
     });
   } catch (error) {
-    log(`Scheduled task error: ${error.message}`, 'error');
+    log(`Daily summary error: ${error.message}`, 'ERROR');
   }
 });
 
-// Start server
+// Start server with enhanced initialization
 app.listen(PORT, async () => {
-  log(`🚀 Enhanced Admin Bot Server running on port ${PORT}`);
-  log(`📡 Webhook URL: ${process.env.RAILWAY_PUBLIC_DOMAIN || `http://localhost:${PORT}`}/webhook`);
+  log(`🚀 Enhanced Admin Bot Server v2.0 running on port ${PORT}`);
+  log(`📡 Webhook URL: ${WEBHOOK_URL}/webhook`);
   log(`👤 Admin Chat ID: ${ADMIN_CHAT_ID}`);
+  log(`🗄️ Database: ${SUPABASE_URL}`);
   
-  // Start monitoring in all environments
-  await startDepositMonitoring();
+  // Send startup notification to admin
+  try {
+    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      chat_id: ADMIN_CHAT_ID,
+      text: `🚀 *BOT STARTED SUCCESSFULLY* 🚀\n\n` +
+            `✅ Server is running on port ${PORT}\n` +
+            `📡 Webhook configured for ${WEBHOOK_URL}\n` +
+            `🕐 Started at: ${new Date().toLocaleString()}\n\n` +
+            `🔄 Initializing deposit monitoring...\n` +
+            `Type /help for available commands.`,
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    log(`Could not send startup notification: ${error.message}`, 'WARN');
+  }
+  
+  // Auto-start monitoring in production
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      await startDepositMonitoring();
+      log('✅ Production monitoring started automatically');
+    } catch (error) {
+      log(`❌ Failed to start monitoring: ${error.message}`, 'ERROR');
+    }
+  }
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  log('Shutting down gracefully...');
+// Graceful shutdown with cleanup
+process.on('SIGTERM', async () => {
+  log('🛑 Shutting down gracefully...');
+  
+  try {
+    // Send shutdown notification
+    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      chat_id: ADMIN_CHAT_ID,
+      text: `⚠️ *BOT SHUTTING DOWN*\n\n` +
+            `🛑 Server is shutting down\n` +
+            `🕐 Shutdown time: ${new Date().toLocaleString()}\n` +
+            `📊 Final stats: ${stats.totalDeposits} total deposits processed\n\n` +
+            `Will restart automatically if configured.`,
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    log(`Could not send shutdown notification: ${error.message}`, 'WARN');
+  }
+  
   if (subscription) {
     subscription.unsubscribe();
+    log('📡 Unsubscribed from database monitoring');
   }
+  
+  log('👋 Graceful shutdown completed');
   process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  log(`💥 Uncaught Exception: ${error.message}`, 'FATAL');
+  console.error(error);
+  stats.errors++;
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log(`💥 Unhandled Rejection at: ${promise}, reason: ${reason}`, 'FATAL');
+  stats.errors++;
 });
