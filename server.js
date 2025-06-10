@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 // Environment variables
-const BOT_TOKEN = process.env.BOT_TOKEN || '7971577643:AAFcL38ZrahWxEyyIcz3dO4aC9yq9LTAD5M';
+const BOT_TOKEN = process.env.BOT_TOKEN || '7971577643:AAEn6W0tKh72B67w-xuTf-6fGDkBW4Od3M4';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '1133538088';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://evberyanshxxalxtwnnc.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV2YmVyeWFuc2h4eGFseHR3bm5jIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQwODMwOTcsImV4cCI6MjA1OTY1OTA5N30.pEoPiIi78Tvl5URw0Xy_vAxsd-3XqRlC8FTnX9HpgMw';
